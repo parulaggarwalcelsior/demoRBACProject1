@@ -1,0 +1,4 @@
+ALTER TABLE `user`
+    DROP COLUMN password,
+    ADD COLUMN password_hash VARCHAR(255) NULL DEFAULT NULL,
+    ADD COLUMN must_reset_password BOOLEAN NOT NULL DEFAULT TRUE;
