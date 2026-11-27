@@ -1,0 +1,105 @@
+name: Schema
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/schema.yml"
+      - ".golangci.yml"
+      - "Makefile"
+      - "compose.schema.yaml"
+      - "go.mod"
+      - "go.sum"
+      - "internal/**"
+      - "migrations/**"
+      - "tests/schema/**"
+      - "specs/001-complete-mysql-schema/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: schema-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  schema-check:
+    name: Disposable MySQL Schema Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      COMPOSE_FILE: compose.schema.yaml
+      COMPOSE_PROJECT_NAME: schema-ci-${{ github.run_id }}-${{ github.run_attempt }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go from module
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Create ephemeral schema configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          password="$(openssl rand -hex 24)"
+          {
+            echo "::add-mask::${password}"
+            echo "SCHEMA_TEST_MYSQL_PASSWORD=${password}"
+            echo "SCHEMA_TEST_DSN=schema_test:${password}@tcp(127.0.0.1:3307)/shopping-cart?parseTime=true&charset=utf8mb4&collation=utf8mb4_0900_bin&loc=UTC"
+          } >> "${GITHUB_ENV}"
+
+      - name: Start disposable MySQL
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose up -d --wait
+
+      - name: Install pinned schema tools
+        run: make tools
+
+      - name: Run non-skipping schema gate
+        run: make schema-check
+
+      - name: Retain sanitized diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/schema
+          {
+            printf 'workflow=%s\n' "${GITHUB_WORKFLOW}"
+            printf 'run_id=%s\n' "${GITHUB_RUN_ID}"
+            printf 'run_attempt=%s\n' "${GITHUB_RUN_ATTEMPT}"
+            printf 'compose_project=%s\n' "${COMPOSE_PROJECT_NAME}"
+            printf 'go_version='
+            go version || true
+            printf 'docker_compose_version='
+            docker compose version || true
+          } > artifacts/schema/diagnostics.txt
+          docker compose ps --all >> artifacts/schema/diagnostics.txt || true
+          docker compose logs --no-color > artifacts/schema/compose.log 2>&1 || true
+          sed -i \
+            -e "s/${SCHEMA_TEST_MYSQL_PASSWORD:-__unset__}/xxxxx/g" \
+            -e 's#schema_test:[^@[:space:]]*@tcp#schema_test:xxxxx@tcp#g' \
+            artifacts/schema/diagnostics.txt artifacts/schema/compose.log
+
+      - name: Upload sanitized diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: schema-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/schema/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Clean owned MySQL instance
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker compose down --volumes --remove-orphans
